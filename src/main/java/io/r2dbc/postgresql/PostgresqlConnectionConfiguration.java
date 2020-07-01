@@ -16,8 +16,12 @@
 
 package io.r2dbc.postgresql;
 
+import static io.r2dbc.postgresql.message.frontend.Execute.NO_LIMIT;
+import static reactor.netty.tcp.SslProvider.DefaultConfigurationType.TCP;
+
+import com.google.cloud.sql.core.CoreSocketFactory;
+import com.google.cloud.sql.core.SslData;
 import io.netty.handler.ssl.SslContextBuilder;
-import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.r2dbc.postgresql.client.ConnectionSettings;
 import io.r2dbc.postgresql.client.DefaultHostnameVerifier;
 import io.r2dbc.postgresql.client.SSLConfig;
@@ -29,24 +33,20 @@ import io.r2dbc.postgresql.message.backend.ErrorResponse;
 import io.r2dbc.postgresql.message.backend.NoticeResponse;
 import io.r2dbc.postgresql.util.Assert;
 import io.r2dbc.postgresql.util.LogLevel;
-import reactor.netty.tcp.SslProvider;
-import reactor.util.annotation.Nullable;
-
-import javax.net.ssl.HostnameVerifier;
-import java.io.File;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.ServiceLoader;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.function.ToIntFunction;
-
-import static io.r2dbc.postgresql.message.frontend.Execute.NO_LIMIT;
-import static reactor.netty.tcp.SslProvider.DefaultConfigurationType.TCP;
+import javax.net.ssl.HostnameVerifier;
+import reactor.netty.tcp.SslProvider;
+import reactor.util.annotation.Nullable;
 
 /**
  * Connection configuration information for connecting to a PostgreSQL database.
@@ -333,6 +333,11 @@ public final class PostgresqlConnectionConfiguration {
 
         private int preparedStatementCacheQueries = -1;
 
+        private String connectionName;
+
+        private Properties connectionProperties;
+
+
         private Builder() {
         }
 
@@ -359,16 +364,18 @@ public final class PostgresqlConnectionConfiguration {
             return this;
         }
 
+        public Builder connectionName(String connectionName) {
+            this.connectionName = connectionName;
+            return this;
+        }
+
+
         /**
          * Returns a configured {@link PostgresqlConnectionConfiguration}.
          *
          * @return a configured {@link PostgresqlConnectionConfiguration}
          */
         public PostgresqlConnectionConfiguration build() {
-
-            if (this.host == null && this.socket == null) {
-                throw new IllegalArgumentException("host or socket must not be null");
-            }
 
             if (this.host != null && this.socket != null) {
                 throw new IllegalArgumentException("Connection must be configured for either host/port or socket usage but not both");
@@ -377,6 +384,11 @@ public final class PostgresqlConnectionConfiguration {
             if (this.username == null) {
                 throw new IllegalArgumentException("username must not be null");
             }
+
+            connectionProperties = new Properties();
+            connectionProperties.setProperty(CoreSocketFactory.CLOUD_SQL_INSTANCE_PROPERTY, this.connectionName);
+
+            this.host = CoreSocketFactory.getHostIp(connectionProperties);
 
             return new PostgresqlConnectionConfiguration(this.applicationName, this.autodetectExtensions, this.connectTimeout, this.database, this.errorResponseLogLevel, this.extensions,
                 this.fetchSize, this.forceBinary, this.noticeLogLevel, this.host, this.options, this.password, this.port, this.schema, this.socket, this.username, this.createSslConfig(),
@@ -724,46 +736,12 @@ public final class PostgresqlConnectionConfiguration {
         }
 
         private Supplier<SslProvider> createSslProvider() {
+            SslData sslData = CoreSocketFactory.getSslData(this.connectionProperties);
+
             SslContextBuilder sslContextBuilder = SslContextBuilder.forClient();
-            if (this.sslMode.verifyCertificate()) {
-                if (this.sslRootCert != null) {
-                    sslContextBuilder.trustManager(new File(this.sslRootCert));
-                }
-            } else {
-                sslContextBuilder.trustManager(InsecureTrustManagerFactory.INSTANCE);
-            }
-
-            String sslKey = this.sslKey;
-            String sslCert = this.sslCert;
-
-            // Emulate Libpq behavior
-            // Determining the default file location
-            String pathSeparator = System.getProperty("file.separator");
-            String defaultDir;
-            if (System.getProperty("os.name").toLowerCase().contains("windows")) { // It is Windows
-                defaultDir = System.getenv("APPDATA") + pathSeparator + "postgresql" + pathSeparator;
-            } else {
-                defaultDir = System.getProperty("user.home") + pathSeparator + ".postgresql" + pathSeparator;
-            }
-
-            if (sslCert == null) {
-                String pathname = defaultDir + "postgresql.crt";
-                if (new File(pathname).exists()) {
-                    sslCert = pathname;
-                }
-            }
-
-            if (sslKey == null) {
-                String pathname = defaultDir + "postgresql.pk8";
-                if (new File(pathname).exists()) {
-                    sslKey = pathname;
-                }
-            }
-
-            if (sslKey != null && sslCert != null) {
-                String sslPassword = this.sslPassword == null ? null : this.sslPassword.toString();
-                sslContextBuilder.keyManager(new File(sslCert), new File(sslKey), sslPassword);
-            }
+            sslContextBuilder.keyManager(sslData.getKeyManagerFactory());
+            sslContextBuilder.trustManager(sslData.getTrustManagerFactory());
+            sslContextBuilder.protocols("TLSv1.2");
 
             return () -> SslProvider.builder()
                 .sslContext(this.sslContextBuilderCustomizer.apply(sslContextBuilder))
